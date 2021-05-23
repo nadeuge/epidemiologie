@@ -1,0 +1,202 @@
+---
+title: "epidemiologie"
+author: "nadege"
+date: "08/05/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(epiphy)
+library(tidyverse)
+```
+
+# Plan de travail:
+
+Travailler sur un jeu de données et développer un
+modèle qui permet de d’évaluer ou prédire la
+relation entre certains paramètres
+
+## Jeux de données à disposition
+
+```{r}
+dat <- as_tibble(tomato_tswv$field_1928)
+dat
+```
+
+## Description des données
+
+Ce jeu de données, récolté par Bald (1937) et distribué par le package R 
+nommé epiphy de Christophe Gigot (2018), contient les données de 4 parcelles.
+
+Chaque parcelle consiste en 14 rangées de 33 plantes (soit 462 plantes par 
+parcelle). La variété de tomates "Early Dwarf" fut utilisées pour les 2
+premières, et la variété "Burwood Prize" pour les 2 autres.
+
+Les tomates furent plantées le 15 Octobre 1928.
+
+Les 2 parcelles dédiées à chaque variété ont été soumises à des formes d'irrigations
+différentes, utilisant soit des rampes d'aspersion aériennes ("overhead-sprays"), soit des tranchées ("trenches").
+
+En dehors de celà elles ont reçu le même traitement.
+
+Des enregistrements hebdomadaires de l'infection au TSMV (tomato spotted wilt virus),
+ont été effectuées du 6 au 12 Décembre.
+
+Nous décrivons les différentes variables du jeu de données :
+
+* plot : Identifiant de la parcelle
+* variety	: Nom de la variété
+* irrigation : Système d'irrigation
+* x,y	: coordonnées spatiales
+* t	Semaine d'évaluation de la maladie (1: 6 Nov, 2: 14 Nov, 3: 21 Nov, 4: 28-29 Nov, 5: 5 Dec, 6: 12 Dec 1928.)
+* i	: Incidence de la maladie (0: sain, 1: malade)
+* n	: Unité d'échantillonage, toujours 1 ici donc ignoré
+
+Compte des observations :
+
+```{r}
+count(dat, plot, variety, irrigation)
+```
+
+## Feature engineering
+
+En plus de ces données, nous créons 2 nouvelles variables, qui varient
+avec le temps, le nombre total de plantes malades dans la parcelle au
+moment de la mesure, et le nombre de plantes voisines malades au moment
+de la mesure.
+
+```{r}
+dat <- dat %>%
+  group_by(plot, t) %>%
+  mutate(total_diseased = sum(i),
+         neighbours_diseased = mapply(
+           function(xi, yi) {
+           sum((x >= xi - 1 & 
+               x <= xi + 1 & 
+               y >= yi - 1 & 
+               y <= yi + 1) & ! (
+                 y == yi & x == xi
+               ) & (i == 1))
+         }, x, y)) %>%
+  ungroup() %>%
+  select(-n)
+
+dat <- dat %>%
+  group_by(x,y) %>%
+  # ajouter état de la semaine précédente
+  # lw : last week
+  mutate(
+    total_diseased_lw = lag(total_diseased),
+    neighbours_diseased_lw = lag(neighbours_diseased),
+    i_lw = lag(i)) %>%
+  ungroup()
+  
+```
+
+
+## Analyse des facteurs (paramètres,variables) qui ont été pris en compte
+
+Nous allons observer l'influences des facteurs variety, irrigation, 
+total_diseased et neighbours_diseased dans la progression de la maladie.
+
+## Déterminer les relations pertinentes à faire entre les variables observées
+
+```{r, fig.height=9}
+dat %>%
+  mutate(
+    plot_label = paste(variety, irrigation, sep = "\n"),
+    time_label = factor(t, labels = c(
+    "6 Nov", "14 Nov", "21 Nov", "28-29 Nov", "5 Dec", "12 Dec")),
+    disease_label = factor(i, levels = c(1, 0), labels = c("Diseased", "Healthy"))
+  ) %>%
+  ggplot(aes(x, y, color = disease_label)) +
+  geom_point() +
+  facet_grid(vars(plot_label), vars(time_label)) +
+  coord_equal() + 
+  theme(legend.title = element_blank()) +
+  ggtitle("Evolution de la maladie en fonction du temps sur les 4 parcelles")
+```
+
+
+```{r}
+dat %>%
+  group_by(plot, variety, irrigation, t) %>%
+  summarize(total_diseased = sum(i), .groups = "drop") %>%
+  mutate(
+    plot_label = paste(variety, irrigation, sep = "\n"),
+    time_label = factor(t, labels = c(
+    "6 Nov", "14 Nov", "21 Nov", "28-29 Nov", "5 Dec", "12 Dec"))
+  ) %>%
+  ggplot(aes(t, total_diseased, color = variety, linetype = irrigation)) +
+  geom_line() + 
+  theme(legend.title = element_blank()) +
+  scale_x_continuous(breaks = 1:6, labels = c(
+    "6 Nov", "14 Nov", "21 Nov", "28-29 Nov", "5 Dec", "12 Dec"), name = "date") +
+  ggtitle("Evolution du nombre total de plantes malades en fonction du temps")
+```
+
+
+## Etablir un modèle qui reflète le mieux la dynamique de développement de l’épidémie
+
+On commence par supprimer la première semaine
+
+```{r}
+# supprimer semaine 1 car pas de semaine prec donc données incomplètes
+dat <- filter(dat, t > 1)
+```
+
+On observe que les plants contaminés ne redeviennent jamais sain, il est donc
+inutile de prévoir ce que deviendra un plant malade (il restera malade), nous
+supprimons donc également des données pour lequels `i_lw` est égal à 1.
+
+```{r}
+# supprimer semaine 1 car pas de semaine prec donc données incomplètes
+dat <- filter(dat, i_lw == 0)
+```
+
+On modélise la variable `i` via une régression logistique en utilisant les variables
+
+* total_diseased_lw : nombre totale de plante infectée la semaine précédente dans la parcelle donnée
+* neighbours_diseased_lw  : nombre de voisins infectés la semaine précédente dans la parcelle donnée
+* i_lw : 1 si la plante était infectée la semaine précédente
+* variety
+* irrigation
+
+```{r}
+mod <- glm(i ~ total_diseased_lw*neighbours_diseased_lw + variety +
+             irrigation,family = "binomial", data = dat )
+```
+
+
+```{r}
+summary(mod)
+diseased_pred <- factor(mod$fitted.values > .5)     # diseased
+diseased_ref <- factor(as.logical(dat$i))           # reference
+caret::confusionMatrix(diseased_pred, diseased_ref)
+```
+
+On voit qu'on a une précision de 75% mais la matrice de confusion nous montre
+qu'on a principalement postulé que les plants sains restaient sains.
+
+En utilisant une valeur de cutoff plus basse on prédit une contamination plus
+grande, même si la précision totale en souffre.
+
+Nous choisissons ici une valeur arbitraire de 0.3 pour le cutoff mais cette valeur
+pourrait être calibrée en simulant 6 semaines de contagion et en les comparant
+à ce qu'on observe dans le dataset.
+
+## Analyser la pertinence du modèle
+
+On voit qu'une plante a davantage de chance d'être contaminée si la semaine
+précédente:
+
+* Le nombre total de plants de tomates contaminées dans la parcelle était plus grand
+* Le nombre de plants voisins malades est plus grand
+* Le plant observé était contaminé
+
+De plus, la variété Early Dwarf a moins de risque d'être contaminée et l'irrigation
+par tranchées augmente le risque, ce qui est cohérent vis à vis de la figure précédente (titre).
+
+Notre modèle permet d'estimer si un plant de tomate est malade d'après l'état de
+la parcelle la semaine précédente avec une précision de 85%.
